@@ -4,21 +4,12 @@
  * Unified REST proxy for LendTech partner portals.
  * Supports BHB Funding and Funders Group (same software, different URLs).
  *
- * Endpoints:
- *   POST /api/auto-login          — Authenticate (handles CSRF + base64 password)
- *   GET  /api/reports/closing      — Closing report (payment detail CSV/Excel)
- *   GET  /api/reports/wallet       — Wallet report (portfolio snapshot CSV/Excel)
- *   GET  /api/portfolio            — Portfolio deals JSON
- *   GET  /api/payouts              — Payout history JSON
- *   GET  /api/proxy                — Generic binary-safe proxy to any portal path
- *   GET  /health                   — Server health check
- *
- * All endpoints except /health require:
- *   Header: Authorization: Bearer <API_KEY>
- *   Header: X-Session-Id: <sessionId from auto-login>  (except auto-login itself)
+ * Auth uses axios (matching the proven BHB MCP server pattern).
+ * Report downloads stream binary via fetch for zero-corruption.
  */
 
 import express from "express";
+import axios from "axios";
 import { Readable } from "stream";
 
 const app = express();
@@ -48,13 +39,13 @@ const PORTALS = {
 
 // ── Session Store ───────────────────────────────────────────────────────────
 
-const sessions = new Map(); // sessionId -> { portal, cookies, createdAt }
+const sessions = new Map();
 let sessionCounter = 0;
 
 // ── Auth Middleware ──────────────────────────────────────────────────────────
 
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // No key configured = open (dev mode)
+  if (!API_KEY) return next();
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${API_KEY}`) {
     return res.status(401).json({ error: "Invalid or missing API key" });
@@ -67,15 +58,15 @@ function requireSession(req, res, next) {
   if (!sid || !sessions.has(sid)) {
     return res.status(401).json({ error: "Invalid or missing session. Call /api/auto-login first." });
   }
-  req.session = sessions.get(sid);
+  req.portalSession = sessions.get(sid);
   req.sessionId = sid;
   next();
 }
 
-// ── Cookie Helpers ──────────────────────────────────────────────────────────
+// ── Cookie Helpers (axios-style, matching BHB MCP client) ───────────────────
 
-function extractCookies(headers) {
-  const setCookies = headers["set-cookie"];
+function extractCookies(resp) {
+  const setCookies = resp.headers["set-cookie"];
   if (!setCookies) return "";
   const arr = Array.isArray(setCookies) ? setCookies : [setCookies];
   return arr.map((c) => c.split(";")[0]).join("; ");
@@ -84,7 +75,6 @@ function extractCookies(headers) {
 function mergeCookies(existing, newCookies) {
   if (!newCookies) return existing;
   const combined = existing ? `${existing}; ${newCookies}` : newCookies;
-  // Deduplicate: keep last value per cookie name
   const map = new Map();
   combined.split(";").forEach((pair) => {
     const trimmed = pair.trim();
@@ -92,29 +82,6 @@ function mergeCookies(existing, newCookies) {
     if (eq > 0) map.set(trimmed.slice(0, eq).trim(), trimmed);
   });
   return [...map.values()].join("; ");
-}
-
-// ── Portal Fetch (binary-safe) ──────────────────────────────────────────────
-
-async function portalFetch(session, path, queryParams = null) {
-  let url = session.baseUrl + path;
-  if (queryParams && Object.keys(queryParams).length) {
-    url += "?" + new URLSearchParams(queryParams).toString();
-  }
-  const resp = await fetch(url, {
-    headers: {
-      Cookie: session.cookies,
-      Accept: "*/*",
-    },
-    redirect: "manual",
-  });
-  // Check for session expiry (redirect to login)
-  const location = resp.headers.get("location") || "";
-  if ((resp.status === 302 || resp.status === 301) && location.toLowerCase().includes("login")) {
-    session.cookies = null;
-    throw new Error("Session expired. Call /api/auto-login again.");
-  }
-  return resp;
 }
 
 // ── Health ───────────────────────────────────────────────────────────────────
@@ -134,7 +101,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Auto-Login ──────────────────────────────────────────────────────────────
+// ── Auto-Login (axios-based, matching BHB MCP client exactly) ───────────────
 
 app.post("/api/auto-login", requireApiKey, async (req, res) => {
   try {
@@ -149,56 +116,63 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       });
     }
 
-    // Step 1: GET /login to extract CSRF token
-    const loginResp = await fetch(portal.baseUrl + "/login", {
-      headers: { Accept: "text/html" },
-      redirect: "follow",
+    const http = axios.create({
+      baseURL: portal.baseUrl,
+      timeout: 30000,
+      maxRedirects: 5,
+      withCredentials: true,
     });
-    const loginHtml = await loginResp.text();
-    const csrfMatch = loginHtml.match(/name="_csrf_token"\s+value="([^"]+)"/);
+
+    // Step 1: GET /login to extract CSRF token + initial cookies
+    const loginPage = await http.get("/login", {
+      headers: { Accept: "text/html" },
+      maxRedirects: 5,
+    });
+    const html = loginPage.data;
+    const csrfMatch = html.match(/name="_csrf_token"\s+value="([^"]+)"/);
     if (!csrfMatch) {
       return res.status(500).json({ error: "Could not extract CSRF token from login page" });
     }
     const csrfToken = csrfMatch[1];
-    let cookies = extractCookies(Object.fromEntries(loginResp.headers.entries()));
+    let cookieJar = extractCookies(loginPage);
 
     // Step 2: POST /login_check with base64-encoded password
     const encodedPassword = Buffer.from(portal.password).toString("base64");
-    const body = `_username=${encodeURIComponent(portal.username)}&_password=${encodeURIComponent(encodedPassword)}&_csrf_token=${encodeURIComponent(csrfToken)}`;
-
-    const checkResp = await fetch(portal.baseUrl + "/login_check", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Cookie: cookies,
-      },
-      redirect: "manual",
-    });
-    cookies = mergeCookies(cookies, extractCookies(Object.fromEntries(checkResp.headers.entries())));
-
-    // Step 3: Follow redirect if present
-    if (checkResp.status >= 300 && checkResp.status < 400) {
-      const redirectUrl = checkResp.headers.get("location");
-      if (redirectUrl) {
-        const fullUrl = redirectUrl.startsWith("http") ? redirectUrl : portal.baseUrl + redirectUrl;
-        const redirectResp = await fetch(fullUrl, {
-          headers: { Cookie: cookies },
-          redirect: "manual",
-        });
-        cookies = mergeCookies(cookies, extractCookies(Object.fromEntries(redirectResp.headers.entries())));
+    const checkResp = await http.post(
+      "/login_check",
+      `_username=${encodeURIComponent(portal.username)}&_password=${encodeURIComponent(encodedPassword)}&_csrf_token=${encodeURIComponent(csrfToken)}`,
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...(cookieJar ? { Cookie: cookieJar } : {}),
+        },
+        maxRedirects: 0,
+        validateStatus: () => true,
       }
+    );
+    cookieJar = mergeCookies(cookieJar, extractCookies(checkResp));
+
+    // Step 3: Follow redirect manually to collect remaining cookies
+    if (checkResp.status >= 300 && checkResp.status < 400 && checkResp.headers.location) {
+      const redirectResp = await http.get(checkResp.headers.location, {
+        headers: { Cookie: cookieJar },
+        maxRedirects: 0,
+        validateStatus: () => true,
+      });
+      cookieJar = mergeCookies(cookieJar, extractCookies(redirectResp));
+    }
+
+    if (!cookieJar) {
+      return res.status(500).json({ error: "No session cookie received after login" });
     }
 
     // Step 4: Verify session works
-    const verifyResp = await fetch(portal.baseUrl + "/auth/permissions", {
-      method: "POST",
-      headers: {
-        Cookie: cookies,
-        "Content-Type": "application/json",
-      },
+    const verify = await http.post("/auth/permissions", null, {
+      headers: { Cookie: cookieJar },
     });
-    if (!verifyResp.ok) {
-      return res.status(500).json({ error: "Login succeeded but session verification failed" });
+    const verifyData = verify.data;
+    if (typeof verifyData === "string" && verifyData.includes("Sign In")) {
+      return res.status(500).json({ error: "Login appeared to succeed but session is not authenticated. Check credentials." });
     }
 
     // Store session
@@ -208,7 +182,7 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       portalName: portal.name,
       baseUrl: portal.baseUrl,
       defaultSyndicatorId: portal.defaultSyndicatorId,
-      cookies,
+      cookies: cookieJar,
       createdAt: new Date().toISOString(),
     });
 
@@ -224,12 +198,33 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
   }
 });
 
+// ── Portal Fetch (binary-safe streaming via fetch API) ──────────────────────
+
+async function portalFetch(session, path, queryParams = null) {
+  let url = session.baseUrl + path;
+  if (queryParams && Object.keys(queryParams).length) {
+    url += "?" + new URLSearchParams(queryParams).toString();
+  }
+  const resp = await fetch(url, {
+    headers: {
+      Cookie: session.cookies,
+      Accept: "*/*",
+    },
+    redirect: "manual",
+  });
+  const location = resp.headers.get("location") || "";
+  if ((resp.status === 302 || resp.status === 301) && location.toLowerCase().includes("login")) {
+    session.cookies = null;
+    throw new Error("Session expired. Call /api/auto-login again.");
+  }
+  return resp;
+}
+
 // ── Report Downloads (binary-safe streaming) ────────────────────────────────
 
-// Closing Report — deal-level payment detail for a date range
 app.get("/api/reports/closing", requireApiKey, requireSession, async (req, res) => {
   try {
-    const syndicatorId = req.query.syndicatorId || req.session.defaultSyndicatorId;
+    const syndicatorId = req.query.syndicatorId || req.portalSession.defaultSyndicatorId;
     const startDate = req.query.startDate;
     const endDate = req.query.endDate;
     const includeAll = req.query.includeAll || "false";
@@ -239,12 +234,12 @@ app.get("/api/reports/closing", requireApiKey, requireSession, async (req, res) 
       return res.status(400).json({ error: "startDate and endDate required (YYYY-MM-DD)" });
     }
 
-    const portalResp = await portalFetch(req.session, "/reports/closing/download", {
-      syndicatorId,
-      startDate,
-      endDate,
-      includeAll,
-      view,
+    const portalResp = await portalFetch(req.portalSession, "/reports/closing/report.csv", {
+      report_id: syndicatorId,
+      allDeals: includeAll,
+      viewType: view,
+      start: startDate,
+      end: endDate,
     });
 
     const ct = portalResp.headers.get("content-type");
@@ -257,22 +252,22 @@ app.get("/api/reports/closing", requireApiKey, requireSession, async (req, res) 
   }
 });
 
-// Wallet Report — portfolio snapshot (all deals, balances, returns)
 app.get("/api/reports/wallet", requireApiKey, requireSession, async (req, res) => {
   try {
-    const syndicatorId = req.query.syndicatorId || req.session.defaultSyndicatorId;
+    const syndicatorId = req.query.syndicatorId || req.portalSession.defaultSyndicatorId;
     const amStatusId = req.query.amStatusId || "";
     const startDate = req.query.startDate || "";
     const endDate = req.query.endDate || "";
     const view = req.query.view || "Syndication";
 
-    const portalResp = await portalFetch(req.session, "/reports/wallet/download", {
-      syndicatorId,
-      amStatusId,
-      startDate,
-      endDate,
-      view,
-    });
+    // Wallet URL builds query string differently: amStatusId= and syndicatorId= as prefix params
+    const params = {};
+    if (amStatusId) params.amStatusId = amStatusId;
+    params.syndicatorId = syndicatorId;
+    params.start = startDate;
+    params.end = endDate;
+    params.viewType = view;
+    const portalResp = await portalFetch(req.portalSession, "/reports/wallet/export.csv", params);
 
     const ct = portalResp.headers.get("content-type");
     const cd = portalResp.headers.get("content-disposition");
@@ -286,13 +281,10 @@ app.get("/api/reports/wallet", requireApiKey, requireSession, async (req, res) =
 
 // ── JSON Data Endpoints ─────────────────────────────────────────────────────
 
-// Portfolio deals
 app.get("/api/portfolio", requireApiKey, requireSession, async (req, res) => {
   try {
-    const syndicatorId = req.query.syndicatorId || req.session.defaultSyndicatorId;
-    const portalResp = await portalFetch(req.session, "/deals/portfolio/syndicated", {
-      syndicatorId,
-    });
+    const syndicatorId = req.query.syndicatorId || req.portalSession.defaultSyndicatorId;
+    const portalResp = await portalFetch(req.portalSession, "/deals/portfolio/syndicated", { syndicatorId });
     const ct = portalResp.headers.get("content-type") || "application/json";
     res.set("content-type", ct);
     Readable.fromWeb(portalResp.body).pipe(res);
@@ -301,23 +293,17 @@ app.get("/api/portfolio", requireApiKey, requireSession, async (req, res) => {
   }
 });
 
-// Payouts
 app.get("/api/payouts", requireApiKey, requireSession, async (req, res) => {
   try {
-    const partnerId = req.query.partnerId || req.session.defaultSyndicatorId;
+    const partnerId = req.query.partnerId || req.portalSession.defaultSyndicatorId;
     const partnerType = req.query.partnerType || "SYN";
     const startDate = req.query.startDate;
     const endDate = req.query.endDate;
-
     if (!startDate || !endDate) {
       return res.status(400).json({ error: "startDate and endDate required (YYYY-MM-DD)" });
     }
-
-    const portalResp = await portalFetch(req.session, "/syndication/payout", {
-      partner_id: partnerId,
-      partner_type: partnerType,
-      start_date: startDate,
-      end_date: endDate,
+    const portalResp = await portalFetch(req.portalSession, "/syndication/payout", {
+      partner_id: partnerId, partner_type: partnerType, start_date: startDate, end_date: endDate,
     });
     const ct = portalResp.headers.get("content-type") || "application/json";
     res.set("content-type", ct);
@@ -327,10 +313,9 @@ app.get("/api/payouts", requireApiKey, requireSession, async (req, res) => {
   }
 });
 
-// Syndicator stats
 app.get("/api/stats", requireApiKey, requireSession, async (req, res) => {
   try {
-    const portalResp = await portalFetch(req.session, "/dashboard/partner_syn_stats");
+    const portalResp = await portalFetch(req.portalSession, "/dashboard/partner_syn_stats");
     const ct = portalResp.headers.get("content-type") || "application/json";
     res.set("content-type", ct);
     Readable.fromWeb(portalResp.body).pipe(res);
@@ -339,7 +324,7 @@ app.get("/api/stats", requireApiKey, requireSession, async (req, res) => {
   }
 });
 
-// ── Generic Proxy (binary-safe, any portal path) ────────────────────────────
+// ── Generic Proxy (binary-safe) ─────────────────────────────────────────────
 
 app.get("/api/proxy", requireApiKey, requireSession, async (req, res) => {
   try {
@@ -349,11 +334,7 @@ app.get("/api/proxy", requireApiKey, requireSession, async (req, res) => {
     for (const [k, v] of Object.entries(req.query)) {
       if (k !== "path") params[k] = v;
     }
-    const portalResp = await portalFetch(
-      req.session,
-      path,
-      Object.keys(params).length ? params : null
-    );
+    const portalResp = await portalFetch(req.portalSession, path, Object.keys(params).length ? params : null);
     const ct = portalResp.headers.get("content-type");
     const cd = portalResp.headers.get("content-disposition");
     if (ct) res.set("content-type", ct);
