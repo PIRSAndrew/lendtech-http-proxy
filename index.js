@@ -167,14 +167,26 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
     }
 
     // Step 4: Verify session works
-    const verify = await http.post("/auth/permissions", null, {
-      headers: { Cookie: cookieJar, Accept: "application/json" },
-    });
-    const verifyData = verify.data;
-    // If the response is HTML containing a login form, session failed
-    if (typeof verifyData === "string" && verifyData.includes("<form") && verifyData.includes("login")) {
-      console.error("Verify failed: got login page HTML. Cookie count:", cookieJar.split(";").length);
-      return res.status(500).json({ error: "Login appeared to succeed but session is not authenticated. Check credentials." });
+    try {
+      const verify = await http.post("/auth/permissions", null, {
+        headers: { Cookie: cookieJar, Accept: "application/json" },
+        maxRedirects: 0,
+        validateStatus: () => true,
+      });
+      const verifyData = verify.data;
+      const verifyStatus = verify.status;
+      console.error(`Verify response: status=${verifyStatus}, type=${typeof verifyData}, length=${typeof verifyData === "string" ? verifyData.length : JSON.stringify(verifyData).length}`);
+      // If we got redirected to login (302) or got the login page HTML, auth failed
+      if (verifyStatus >= 300 && verifyStatus < 400) {
+        console.error("Verify failed: got redirect to", verify.headers.location);
+        return res.status(500).json({ error: "Login appeared to succeed but session is not authenticated. Got redirect on verify." });
+      }
+      if (typeof verifyData === "string" && verifyData.includes("<form") && verifyData.includes("_username")) {
+        console.error("Verify failed: got login form HTML");
+        return res.status(500).json({ error: "Login appeared to succeed but session is not authenticated. Check credentials." });
+      }
+    } catch (verifyErr) {
+      console.error("Verify request failed:", verifyErr.message, "- proceeding anyway");
     }
 
     // Store session
