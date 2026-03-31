@@ -148,12 +148,16 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       html = await resp.text();
       break;
     }
+    console.error("Login page HTML length:", html.length, "title:", (html.match(/<title>([^<]*)<\/title>/) || [])[1] || "none");
     const csrfMatch = html.match(/name="_csrf_token"\s+value="([^"]+)"/);
     if (!csrfMatch) {
+      console.error("HTML snippet:", html.substring(0, 500));
       return res.status(500).json({ error: "Could not extract CSRF token from login page", cookieCount: cookieJar.split(";").length });
     }
     const csrfToken = csrfMatch[1];
-    console.error("After step 1 (GET /login):", `${cookieJar.split(";").length} cookies, CSRF token: ${csrfToken.substring(0, 20)}...`);
+    console.error("After step 1: CSRF found, cookies:", cookieJar.split(";").length);
+    // Also log the login_check redirect to see if it goes to /login (fail) or / (success)
+
 
     // Step 2: POST /login_check with base64-encoded password
     // Use native fetch for reliable set-cookie header access
@@ -175,7 +179,11 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
     // Extract cookies from fetch response using getSetCookie()
     const checkCookies = checkResp.headers.getSetCookie ? checkResp.headers.getSetCookie() : [];
     const checkLocation = checkResp.headers.get("location") || "";
-    console.error("login_check response: status=", checkResp.status, "location=", checkLocation, "set-cookie count=", checkCookies.length);
+    console.error("login_check: status=", checkResp.status, "location=", checkLocation, "cookies=", checkCookies.length);
+    // If login failed (redirect to /login), try to read the error from the redirect page
+    if (checkLocation.includes("login")) {
+      console.error("LOGIN FAILED — redirected back to login page");
+    }
     if (checkCookies.length) {
       const newCookies = checkCookies.map(c => c.split(";")[0]).join("; ");
       cookieJar = mergeCookies(cookieJar, newCookies);
