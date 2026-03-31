@@ -168,10 +168,12 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
 
     // Step 4: Verify session works
     const verify = await http.post("/auth/permissions", null, {
-      headers: { Cookie: cookieJar },
+      headers: { Cookie: cookieJar, Accept: "application/json" },
     });
     const verifyData = verify.data;
-    if (typeof verifyData === "string" && verifyData.includes("Sign In")) {
+    // If the response is HTML containing a login form, session failed
+    if (typeof verifyData === "string" && verifyData.includes("<form") && verifyData.includes("login")) {
+      console.error("Verify failed: got login page HTML. Cookie count:", cookieJar.split(";").length);
       return res.status(500).json({ error: "Login appeared to succeed but session is not authenticated. Check credentials." });
     }
 
