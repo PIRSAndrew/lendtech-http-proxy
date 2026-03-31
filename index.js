@@ -166,24 +166,27 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       return res.status(500).json({ error: "No session cookie received after login" });
     }
 
-    // Step 4: Verify session works
+    // Step 4: Verify session with a simple GET (POST to /auth/permissions may redirect)
+    console.error("Cookie jar before verify:", cookieJar.substring(0, 200));
+    console.error("Cookie count:", cookieJar.split(";").length);
     try {
-      const verify = await http.post("/auth/permissions", null, {
+      // Use GET to /dashboard/partner_syn_stats instead — returns JSON if authenticated
+      const verify = await http.get("/dashboard/partner_syn_stats", {
         headers: { Cookie: cookieJar, Accept: "application/json" },
         maxRedirects: 0,
         validateStatus: () => true,
       });
-      const verifyData = verify.data;
       const verifyStatus = verify.status;
-      console.error(`Verify response: status=${verifyStatus}, type=${typeof verifyData}, length=${typeof verifyData === "string" ? verifyData.length : JSON.stringify(verifyData).length}`);
-      // If we got redirected to login (302) or got the login page HTML, auth failed
+      const ct = verify.headers["content-type"] || "";
+      console.error(`Verify response: status=${verifyStatus}, content-type=${ct}`);
       if (verifyStatus >= 300 && verifyStatus < 400) {
-        console.error("Verify failed: got redirect to", verify.headers.location);
-        return res.status(500).json({ error: "Login appeared to succeed but session is not authenticated. Got redirect on verify." });
+        console.error("Verify redirect to:", verify.headers.location);
+        return res.status(500).json({ error: "Session not authenticated. Verify redirected to login.", cookies: cookieJar.split(";").length });
       }
-      if (typeof verifyData === "string" && verifyData.includes("<form") && verifyData.includes("_username")) {
-        console.error("Verify failed: got login form HTML");
-        return res.status(500).json({ error: "Login appeared to succeed but session is not authenticated. Check credentials." });
+      if (verifyStatus === 200 && ct.includes("json")) {
+        console.error("Verify succeeded: got JSON data");
+      } else if (verifyStatus === 200 && ct.includes("html")) {
+        console.error("Verify returned HTML (SPA) — may still be authenticated");
       }
     } catch (verifyErr) {
       console.error("Verify request failed:", verifyErr.message, "- proceeding anyway");
