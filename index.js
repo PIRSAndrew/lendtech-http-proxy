@@ -125,26 +125,35 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       });
     }
 
-    const http = axios.create({
-      baseURL: portal.baseUrl,
-      timeout: 30000,
-      maxRedirects: 5,
-      withCredentials: true,
-    });
-
-    // Step 1: GET /login to extract CSRF token + initial cookies
-    const loginPage = await http.get("/login", {
-      headers: { Accept: "text/html" },
-      maxRedirects: 5,
-    });
-    const html = loginPage.data;
+    // Step 1: GET /login — use native fetch, follow redirects manually to capture all cookies
+    let cookieJar = "";
+    let loginUrl = portal.baseUrl + "/login";
+    let html = "";
+    for (let i = 0; i < 5; i++) {
+      const resp = await fetch(loginUrl, {
+        headers: { Accept: "text/html", ...(cookieJar ? { Cookie: cookieJar } : {}) },
+        redirect: "manual",
+      });
+      const respCookies = resp.headers.getSetCookie ? resp.headers.getSetCookie() : [];
+      if (respCookies.length) {
+        const nc = respCookies.map(c => c.split(";")[0]).join("; ");
+        cookieJar = mergeCookies(cookieJar, nc);
+        console.error(`Step 1 redirect ${i}: ${resp.status}, got ${respCookies.length} cookie(s)`);
+      }
+      if (resp.status >= 300 && resp.status < 400) {
+        const loc = resp.headers.get("location") || "";
+        loginUrl = loc.startsWith("http") ? loc : portal.baseUrl + loc;
+        continue;
+      }
+      html = await resp.text();
+      break;
+    }
     const csrfMatch = html.match(/name="_csrf_token"\s+value="([^"]+)"/);
     if (!csrfMatch) {
-      return res.status(500).json({ error: "Could not extract CSRF token from login page" });
+      return res.status(500).json({ error: "Could not extract CSRF token from login page", cookieCount: cookieJar.split(";").length });
     }
     const csrfToken = csrfMatch[1];
-    let cookieJar = extractCookies(loginPage);
-    console.error("After step 1 (GET /login):", cookieJar ? `${cookieJar.split(";").length} cookies` : "NO COOKIES");
+    console.error("After step 1 (GET /login):", `${cookieJar.split(";").length} cookies, CSRF found`);
 
     // Step 2: POST /login_check with base64-encoded password
     // Use native fetch for reliable set-cookie header access
