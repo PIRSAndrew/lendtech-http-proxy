@@ -153,12 +153,13 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       return res.status(500).json({ error: "Could not extract CSRF token from login page", cookieCount: cookieJar.split(";").length });
     }
     const csrfToken = csrfMatch[1];
-    console.error("After step 1 (GET /login):", `${cookieJar.split(";").length} cookies, CSRF found`);
+    console.error("After step 1 (GET /login):", `${cookieJar.split(";").length} cookies, CSRF token: ${csrfToken.substring(0, 20)}...`);
 
     // Step 2: POST /login_check with base64-encoded password
     // Use native fetch for reliable set-cookie header access
     const encodedPassword = Buffer.from(portal.password).toString("base64");
     const loginBody = `_username=${encodeURIComponent(portal.username)}&_password=${encodeURIComponent(encodedPassword)}&_csrf_token=${encodeURIComponent(csrfToken)}`;
+    console.error("login_check body (redacted):", `_username=${portal.username}&_password=[base64]&_csrf_token=[token]`);
     const checkResp = await fetch(portal.baseUrl + "/login_check", {
       method: "POST",
       headers: {
@@ -170,7 +171,8 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
     });
     // Extract cookies from fetch response using getSetCookie()
     const checkCookies = checkResp.headers.getSetCookie ? checkResp.headers.getSetCookie() : [];
-    console.error("login_check response: status=", checkResp.status, "set-cookie count=", checkCookies.length);
+    const checkLocation = checkResp.headers.get("location") || "";
+    console.error("login_check response: status=", checkResp.status, "location=", checkLocation, "set-cookie count=", checkCookies.length);
     if (checkCookies.length) {
       const newCookies = checkCookies.map(c => c.split(";")[0]).join("; ");
       cookieJar = mergeCookies(cookieJar, newCookies);
@@ -178,7 +180,6 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
     console.error("After step 2 (POST /login_check):", `${cookieJar.split(";").length} cookies`);
 
     // Step 3: Follow redirect manually to collect remaining cookies
-    const checkLocation = checkResp.headers.get("location");
     if (checkResp.status >= 300 && checkResp.status < 400 && checkLocation) {
       const redirectUrl = checkLocation.startsWith("http") ? checkLocation : portal.baseUrl + checkLocation;
       const redirectResp = await fetch(redirectUrl, {
