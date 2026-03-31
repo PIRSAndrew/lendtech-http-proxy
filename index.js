@@ -66,10 +66,19 @@ function requireSession(req, res, next) {
 // ── Cookie Helpers (axios-style, matching BHB MCP client) ───────────────────
 
 function extractCookies(resp) {
-  const setCookies = resp.headers["set-cookie"];
+  // Try multiple approaches — axios + Node versions handle set-cookie differently
+  let setCookies;
+  // Method 1: axios typically exposes set-cookie as an array
+  setCookies = resp.headers["set-cookie"];
+  // Method 2: raw headers via getSetCookie() (Node 20+)
+  if ((!setCookies || (Array.isArray(setCookies) && setCookies.length === 0)) && resp.headers?.raw) {
+    try { setCookies = resp.headers.raw()["set-cookie"]; } catch {}
+  }
   if (!setCookies) return "";
   const arr = Array.isArray(setCookies) ? setCookies : [setCookies];
-  return arr.map((c) => c.split(";")[0]).join("; ");
+  const result = arr.map((c) => c.split(";")[0]).join("; ");
+  console.error(`extractCookies: found ${arr.length} cookie(s): ${arr.map(c => c.split("=")[0]).join(", ")}`);
+  return result;
 }
 
 function mergeCookies(existing, newCookies) {
@@ -135,6 +144,7 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
     }
     const csrfToken = csrfMatch[1];
     let cookieJar = extractCookies(loginPage);
+    console.error("After step 1 (GET /login):", cookieJar ? `${cookieJar.split(";").length} cookies` : "NO COOKIES");
 
     // Step 2: POST /login_check with base64-encoded password
     const encodedPassword = Buffer.from(portal.password).toString("base64");
@@ -151,6 +161,7 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       }
     );
     cookieJar = mergeCookies(cookieJar, extractCookies(checkResp));
+    console.error("After step 2 (POST /login_check): status=", checkResp.status, `${cookieJar.split(";").length} cookies`);
 
     // Step 3: Follow redirect manually to collect remaining cookies
     if (checkResp.status >= 300 && checkResp.status < 400 && checkResp.headers.location) {
@@ -161,6 +172,7 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       });
       cookieJar = mergeCookies(cookieJar, extractCookies(redirectResp));
     }
+    console.error("After step 3 (redirect):", `${cookieJar.split(";").length} cookies`);
 
     if (!cookieJar) {
       return res.status(500).json({ error: "No session cookie received after login" });
