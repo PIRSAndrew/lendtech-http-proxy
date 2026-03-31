@@ -147,30 +147,40 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
     console.error("After step 1 (GET /login):", cookieJar ? `${cookieJar.split(";").length} cookies` : "NO COOKIES");
 
     // Step 2: POST /login_check with base64-encoded password
+    // Use native fetch for reliable set-cookie header access
     const encodedPassword = Buffer.from(portal.password).toString("base64");
-    const checkResp = await http.post(
-      "/login_check",
-      `_username=${encodeURIComponent(portal.username)}&_password=${encodeURIComponent(encodedPassword)}&_csrf_token=${encodeURIComponent(csrfToken)}`,
-      {
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          ...(cookieJar ? { Cookie: cookieJar } : {}),
-        },
-        maxRedirects: 0,
-        validateStatus: () => true,
-      }
-    );
-    cookieJar = mergeCookies(cookieJar, extractCookies(checkResp));
-    console.error("After step 2 (POST /login_check): status=", checkResp.status, `${cookieJar.split(";").length} cookies`);
+    const loginBody = `_username=${encodeURIComponent(portal.username)}&_password=${encodeURIComponent(encodedPassword)}&_csrf_token=${encodeURIComponent(csrfToken)}`;
+    const checkResp = await fetch(portal.baseUrl + "/login_check", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(cookieJar ? { Cookie: cookieJar } : {}),
+      },
+      body: loginBody,
+      redirect: "manual",
+    });
+    // Extract cookies from fetch response using getSetCookie()
+    const checkCookies = checkResp.headers.getSetCookie ? checkResp.headers.getSetCookie() : [];
+    console.error("login_check response: status=", checkResp.status, "set-cookie count=", checkCookies.length);
+    if (checkCookies.length) {
+      const newCookies = checkCookies.map(c => c.split(";")[0]).join("; ");
+      cookieJar = mergeCookies(cookieJar, newCookies);
+    }
+    console.error("After step 2 (POST /login_check):", `${cookieJar.split(";").length} cookies`);
 
     // Step 3: Follow redirect manually to collect remaining cookies
-    if (checkResp.status >= 300 && checkResp.status < 400 && checkResp.headers.location) {
-      const redirectResp = await http.get(checkResp.headers.location, {
+    const checkLocation = checkResp.headers.get("location");
+    if (checkResp.status >= 300 && checkResp.status < 400 && checkLocation) {
+      const redirectUrl = checkLocation.startsWith("http") ? checkLocation : portal.baseUrl + checkLocation;
+      const redirectResp = await fetch(redirectUrl, {
         headers: { Cookie: cookieJar },
-        maxRedirects: 0,
-        validateStatus: () => true,
+        redirect: "manual",
       });
-      cookieJar = mergeCookies(cookieJar, extractCookies(redirectResp));
+      const redirCookies = redirectResp.headers.getSetCookie ? redirectResp.headers.getSetCookie() : [];
+      if (redirCookies.length) {
+        const rc = redirCookies.map(c => c.split(";")[0]).join("; ");
+        cookieJar = mergeCookies(cookieJar, rc);
+      }
     }
     console.error("After step 3 (redirect):", `${cookieJar.split(";").length} cookies`);
 
