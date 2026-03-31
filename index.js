@@ -279,12 +279,50 @@ app.get("/api/reports/wallet", requireApiKey, requireSession, async (req, res) =
   }
 });
 
+app.get("/api/reports/portfolio", requireApiKey, requireSession, async (req, res) => {
+  try {
+    const syndicatorId = req.query.syndicatorId || req.portalSession.defaultSyndicatorId;
+    const amStatusId = req.query.amStatusId || "0";
+    const portalResp = await portalFetch(req.portalSession, `/deals/portfolio/syndicated/csv/${syndicatorId}/${amStatusId}`);
+    const ct = portalResp.headers.get("content-type");
+    const cd = portalResp.headers.get("content-disposition");
+    if (ct) res.set("content-type", ct);
+    if (cd) res.set("content-disposition", cd);
+    Readable.fromWeb(portalResp.body).pipe(res);
+  } catch (e) {
+    res.status(e.message.includes("expired") ? 401 : 500).json({ error: e.message });
+  }
+});
+
+app.get("/api/reports/payouts", requireApiKey, requireSession, async (req, res) => {
+  try {
+    const partnerId = req.query.partnerId || req.portalSession.defaultSyndicatorId;
+    const partnerType = req.query.partnerType || "SYN";
+    const startDate = req.query.startDate;
+    const endDate = req.query.endDate;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: "startDate and endDate required (YYYY-MM-DD)" });
+    }
+    const portalResp = await portalFetch(req.portalSession, "/syndication/payout/report.csv", {
+      partner_id: partnerId, partner_type: partnerType, start: startDate, end: endDate,
+    });
+    const ct = portalResp.headers.get("content-type");
+    const cd = portalResp.headers.get("content-disposition");
+    if (ct) res.set("content-type", ct);
+    if (cd) res.set("content-disposition", cd);
+    Readable.fromWeb(portalResp.body).pipe(res);
+  } catch (e) {
+    res.status(e.message.includes("expired") ? 401 : 500).json({ error: e.message });
+  }
+});
+
 // ── JSON Data Endpoints ─────────────────────────────────────────────────────
 
 app.get("/api/portfolio", requireApiKey, requireSession, async (req, res) => {
   try {
     const syndicatorId = req.query.syndicatorId || req.portalSession.defaultSyndicatorId;
-    const portalResp = await portalFetch(req.portalSession, "/deals/portfolio/syndicated", { syndicatorId });
+    const amStatusId = req.query.amStatusId || "";
+    const portalResp = await portalFetch(req.portalSession, "/deals/portfolio/syndicated", { id: syndicatorId, amStatusId });
     const ct = portalResp.headers.get("content-type") || "application/json";
     res.set("content-type", ct);
     Readable.fromWeb(portalResp.body).pipe(res);
@@ -303,7 +341,7 @@ app.get("/api/payouts", requireApiKey, requireSession, async (req, res) => {
       return res.status(400).json({ error: "startDate and endDate required (YYYY-MM-DD)" });
     }
     const portalResp = await portalFetch(req.portalSession, "/syndication/payout", {
-      partner_id: partnerId, partner_type: partnerType, start_date: startDate, end_date: endDate,
+      partner_id: partnerId, partner_type: partnerType, start: startDate, end: endDate, payment_status: req.query.paymentStatus || "", order: "", type: "",
     });
     const ct = portalResp.headers.get("content-type") || "application/json";
     res.set("content-type", ct);
@@ -354,8 +392,10 @@ app.listen(PORT, () => {
   console.log(`  API Key  : ${API_KEY ? "required" : "NOT SET (open access)"}`);
   console.log(`  Endpoints:`);
   console.log(`    POST /api/auto-login       — Authenticate with a portal`);
-  console.log(`    GET  /api/reports/closing   — Closing report (payment CSV)`);
-  console.log(`    GET  /api/reports/wallet    — Wallet report (portfolio CSV)`);
+  console.log(`    GET  /api/reports/closing   — Closing report (collections CSV)`);
+  console.log(`    GET  /api/reports/wallet    — Wallet ledger (cash txns CSV)`);
+  console.log(`    GET  /api/reports/portfolio — Portfolio export (deals CSV)`);
+  console.log(`    GET  /api/reports/payouts   — Payouts export (payments CSV)`);
   console.log(`    GET  /api/portfolio         — Portfolio deals JSON`);
   console.log(`    GET  /api/payouts           — Payout history JSON`);
   console.log(`    GET  /api/stats             — Syndicator stats JSON`);
