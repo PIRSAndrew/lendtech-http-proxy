@@ -110,7 +110,43 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Auto-Login (axios-based, matching BHB MCP client exactly) ───────────────
+// ── Cookie-Based Login (for portals that block data center IPs) ─────────────
+
+app.post("/api/cookie-login", requireApiKey, async (req, res) => {
+  try {
+    const portalKey = (req.body.portal || "bhb").toLowerCase();
+    const portal = PORTALS[portalKey];
+    if (!portal) return res.status(400).json({ error: `Unknown portal: ${portalKey}` });
+
+    const cookie = req.body.cookie;
+    if (!cookie) return res.status(400).json({ error: "cookie field required (paste your browser PHPSESSID cookie string)" });
+
+    // Verify the cookie works
+    const verifyResp = await fetch(portal.baseUrl + "/dashboard/partner_syn_stats", {
+      headers: { Cookie: cookie, Accept: "application/json" },
+      redirect: "manual",
+    });
+    if (verifyResp.status >= 300 || !(verifyResp.headers.get("content-type") || "").includes("json")) {
+      return res.status(401).json({ error: "Cookie is invalid or expired. Get a fresh one from your browser." });
+    }
+
+    const sid = `lendtech-${portalKey}-${++sessionCounter}-${Date.now()}`;
+    sessions.set(sid, {
+      portal: portalKey,
+      portalName: portal.name,
+      baseUrl: portal.baseUrl,
+      defaultSyndicatorId: portal.defaultSyndicatorId,
+      cookies: cookie,
+      createdAt: new Date().toISOString(),
+    });
+
+    res.json({ authenticated: true, sessionId: sid, portal: portalKey, portalName: portal.name, defaultSyndicatorId: portal.defaultSyndicatorId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Auto-Login (username/password flow) ─────────────────────────────────────
 
 app.post("/api/auto-login", requireApiKey, async (req, res) => {
   try {
