@@ -188,30 +188,25 @@ app.post("/api/auto-login", requireApiKey, async (req, res) => {
       return res.status(500).json({ error: "No session cookie received after login" });
     }
 
-    // Step 4: Verify session with a simple GET (POST to /auth/permissions may redirect)
+    // Step 4: Verify session using native fetch (axios drops cookies on Railway)
     console.error("Cookie jar before verify:", cookieJar.substring(0, 200));
-    console.error("Cookie count:", cookieJar.split(";").length);
     try {
-      // Use GET to /dashboard/partner_syn_stats instead — returns JSON if authenticated
-      const verify = await http.get("/dashboard/partner_syn_stats", {
+      const verifyResp = await fetch(portal.baseUrl + "/dashboard/partner_syn_stats", {
         headers: { Cookie: cookieJar, Accept: "application/json" },
-        maxRedirects: 0,
-        validateStatus: () => true,
+        redirect: "manual",
       });
-      const verifyStatus = verify.status;
-      const ct = verify.headers["content-type"] || "";
-      console.error(`Verify response: status=${verifyStatus}, content-type=${ct}`);
+      const verifyStatus = verifyResp.status;
+      const ct = verifyResp.headers.get("content-type") || "";
+      console.error(`Verify: status=${verifyStatus}, ct=${ct}`);
       if (verifyStatus >= 300 && verifyStatus < 400) {
-        console.error("Verify redirect to:", verify.headers.location);
-        return res.status(500).json({ error: "Session not authenticated. Verify redirected to login.", cookies: cookieJar.split(";").length });
-      }
-      if (verifyStatus === 200 && ct.includes("json")) {
-        console.error("Verify succeeded: got JSON data");
-      } else if (verifyStatus === 200 && ct.includes("html")) {
-        console.error("Verify returned HTML (SPA) — may still be authenticated");
+        const loc = verifyResp.headers.get("location") || "";
+        console.error("Verify redirect to:", loc);
+        if (loc.includes("login")) {
+          return res.status(500).json({ error: "Session not authenticated. Login may have failed.", debug: { cookies: cookieJar.split(";").length, redirectTo: loc } });
+        }
       }
     } catch (verifyErr) {
-      console.error("Verify request failed:", verifyErr.message, "- proceeding anyway");
+      console.error("Verify failed:", verifyErr.message, "- proceeding anyway");
     }
 
     // Store session
